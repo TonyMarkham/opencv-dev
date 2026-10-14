@@ -237,12 +237,26 @@ consistent.
 > grep -n "OPENCV_SOVERSION" tmp/opencv/opencv/cmake/OpenCVModule.cmake
 > ```
 >
-> Two facts nearby, both verified at the tag and both fine to leave
-> alone: `cmake/OpenCVVersion.cmake` still *defines* `OPENCV_SOVERSION`
-> after the patch (it becomes an unused variable — harmless), and
-> `cmake/OpenCVInstallLayout.cmake` still sets `CMAKE_INSTALL_RPATH` to
-> the prefix's `lib/` — that affects OpenCV's own test/sample binaries
-> only, not consumers of the installed libraries.
+> Two facts nearby, both verified at the tag. `cmake/OpenCVVersion.cmake`
+> still *defines* `OPENCV_SOVERSION` after the patch (it becomes an
+> unused variable — harmless), and `cmake/OpenCVInstallLayout.cmake`
+> still sets `CMAKE_INSTALL_RPATH` to the prefix's `lib/` (lines 99–100,
+> together with `CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE`). That is a
+> *global* variable: it applies to every target in the configure, the 16
+> `libopencv_*.so` modules included. Left alone, each installed module
+> carries an ELF `RUNPATH` holding the absolute build-machine prefix
+> (observed on a real build:
+> `RUNPATH  /home/<user>/git/opencv-dev/dist/opencv/x86_64-linux/lib`)
+> — the build machine's layout leaks
+> into the zips, and inter-module resolution breaks on any machine
+> where that path does not exist unless `LD_LIBRARY_PATH` rescues it.
+> The 2.2 configure therefore pins
+> `-DCMAKE_INSTALL_RPATH="\$ORIGIN"`: `ocv_update`, the macro OpenCV's
+> script uses to set the variable, preserves a value that is already
+> defined, so the pin wins. `$ORIGIN` is the ld.so placeholder for the
+> directory the library itself lives in, so modules resolve their
+> siblings relative to their own location and the zips stay relocatable.
+> The 2.4 `objdump` note verifies the result.
 
 > ### 2.2 Configure — generates the build plan; nothing compiles yet
 >
@@ -250,6 +264,7 @@ consistent.
 > cmake -S tmp/opencv/opencv -B tmp/opencv/build -G Ninja \
 >       -DCMAKE_BUILD_TYPE=Release \
 >       -DCMAKE_INSTALL_PREFIX="$PWD/dist/opencv/x86_64-linux" \
+>       -DCMAKE_INSTALL_RPATH="\$ORIGIN" \
 >       -DBUILD_SHARED_LIBS=ON \
 >       -DBUILD_ZLIB=ON \
 >       -DBUILD_TIFF=ON \
@@ -288,6 +303,15 @@ consistent.
 >   unsuffixed directories (`lib`, not `lib/Debug` variants).
 > - `-DCMAKE_INSTALL_PREFIX=...` — OpenCV's install prefix (the standard
 >   CMake variable; there is no OCCT-style `INSTALL_DIR` alias).
+> - `-DCMAKE_INSTALL_RPATH="\$ORIGIN"` — the `RUNPATH` written into the
+>   installed modules. This overrides the global prefix-based
+>   `CMAKE_INSTALL_RPATH` from `OpenCVInstallLayout.cmake` (see the 2.1
+>   note — the macro that sets it preserves an already-defined value).
+>   With `$ORIGIN`, each module finds its sibling modules relative to
+>   its own directory: correct in the dev tree (`lib/`), correct in the
+>   flattened libs-only zip, and free of the build machine's absolute
+>   prefix. The backslash keeps the shell from expanding `$ORIGIN` as an
+>   environment variable — CMake must receive the literal `$ORIGIN`.
 > - `-DBUILD_SHARED_LIBS=ON` — build `.so` files to distribute. This is
 >   the default (except on Android/framework builds); spelled out for
 >   clarity.
@@ -596,8 +620,9 @@ consistent.
 > versioned `.so.*` files and no symlinks). Because an ELF dependent
 > records each dependency's *SONAME* in its `DT_NEEDED` entry, every
 > inter-module reference is the plain name `libopencv_core.so` — the
-> loader resolves those names through `LD_LIBRARY_PATH` and the
-> standard system paths, never through absolute library paths. The
+> loader resolves those names through each module's own `RUNPATH`
+> (`$ORIGIN` since the 2.2 pin), then `LD_LIBRARY_PATH` and the standard
+> system paths — never through an absolute build-machine path. The
 > SONAME is what makes the plain-name resolution work for transitive
 > dependencies: without it, a module's dependents would record its
 > absolute build-tree path. (Without the 2.1 patch, the SONAME would
@@ -614,7 +639,15 @@ consistent.
 > plus system libraries (libc, libpthread via libc, libdl via libc, and
 > — through the GTK-enabled highgui — the GTK/GLib tree). Any
 > non-system, non-OpenCV entry that is not GTK/GLib is a leaked
-> third-party dependency — re-check the configure switches.
+> third-party dependency — re-check the configure switches. One more
+> check, proving the 2.2 rpath pin took effect (must print exactly
+> `RUNPATH      $ORIGIN`; an absolute `/home/...` path here means the
+> pin was not passed and the zips would carry the build machine's
+> prefix):
+>
+> ```
+> objdump -p dist/opencv/x86_64-linux/lib/libopencv_core.so | grep -i runpath
+> ```
 
 > ## 3. Validate with sample/ (headless PNG round trip)
 >
@@ -679,7 +712,10 @@ consistent.
 >
 > (The `setup_vars_opencv5.sh` script OpenCV installs under `bin/`
 > performs the same export — and also appends a placeholder PYTHONPATH
-> entry; harmless with the bindings off.)
+> entry; harmless with the bindings off.) The export covers the
+> *executable's* direct dependencies; module-to-module references
+> resolve on their own via the `$ORIGIN` `RUNPATH` from the 2.2 pin —
+> including inside the flattened libs-only zip.
 >
 > **3.6** Go where the built exe is:
 >
@@ -717,10 +753,11 @@ consistent.
 > The run proves the full loop: CMake finds the installed package
 > through `CMAKE_PREFIX_PATH`, a C++17 consumer compiles against the
 > OpenCV 5.0 headers, the `.so` files load from `lib/` via
-> `LD_LIBRARY_PATH` (the 2.4 `objdump` note explains why the plain
-> names suffice), the vendored libpng+zlib stack encodes and decodes a
-> real PNG, and imgproc computes a predictable result. It does not
-> exercise video I/O, GUI windows, DNN inference, or deployment to
+> `LD_LIBRARY_PATH` (module-to-module references ride the `$ORIGIN`
+> `RUNPATH` from the 2.2 pin; the 2.4 `objdump` note explains why the
+> plain names suffice), the vendored libpng+zlib stack encodes and
+> decodes a real PNG, and imgproc computes a predictable result. It does
+> not exercise video I/O, GUI windows, DNN inference, or deployment to
 > another machine — but nothing about this path needs extra environment
 > setup (`OPENCV_*` data variables are not required for this round
 > trip).

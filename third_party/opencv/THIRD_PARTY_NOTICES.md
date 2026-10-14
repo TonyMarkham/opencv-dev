@@ -229,7 +229,10 @@ every archive:
 - The libraries install as plain unversioned `libopencv_*.so` files
   (the `VERSION`/`SOVERSION` patch above), whose SONAME is the plain
   filename — consumers' `DT_NEEDED` entries are the plain names,
-  resolved via `LD_LIBRARY_PATH`/rpath rather than absolute paths.
+  resolved via each module's own `RUNPATH` (`$ORIGIN`: the directory
+  the library itself lives in) and then the consumer's
+  `LD_LIBRARY_PATH`/system paths — never an absolute build-machine
+  path.
 
 The dev archive contains OpenCV's own per-component license directory —
 `share/licenses/opencv5/` on macOS and Linux, `etc\licenses\` on

@@ -253,6 +253,7 @@ consistent.
 > cmake -S tmp/opencv/opencv -B tmp/opencv/build -G Ninja \
 >       -DCMAKE_BUILD_TYPE=Release \
 >       -DCMAKE_INSTALL_PREFIX="$PWD/dist/opencv/arm64-macos" \
+>       -DCMAKE_INSTALL_RPATH="@loader_path" \
 >       -DBUILD_SHARED_LIBS=ON \
 >       -DBUILD_TESTS=OFF \
 >       -DBUILD_PERF_TESTS=OFF \
@@ -281,6 +282,14 @@ consistent.
 >   unsuffixed directories (`lib`, not `lib/Debug` variants).
 > - `-DCMAKE_INSTALL_PREFIX=...` — OpenCV's install prefix (the standard
 >   CMake variable; there is no OCCT-style `INSTALL_DIR` alias).
+> - `-DCMAKE_INSTALL_RPATH="@loader_path"` — the `LC_RPATH` written into
+>   the installed dylibs. This overrides the global prefix-based
+>   `CMAKE_INSTALL_RPATH` from `OpenCVInstallLayout.cmake` (see the 2.4
+>   `otool -D` note — the macro that sets it preserves an
+>   already-defined value). With `@loader_path`, each dylib resolves its
+>   sibling dylibs relative to its own directory: correct in the dev
+>   tree (`lib/`), correct in the flattened libs-only zip, and free of
+>   the build machine's absolute prefix.
 > - `-DBUILD_SHARED_LIBS=ON` — build `.dylib` files to distribute. This
 >   is the default (except on Android/framework builds); spelled out for
 >   clarity.
@@ -508,12 +517,32 @@ consistent.
 > `@rpath/libopencv_core.dylib`. That is CMake's macOS default with
 > OpenCV's settings: OpenCV sets no `INSTALL_NAME_DIR` for non-framework
 > builds, and with `cmake_minimum_required (VERSION 3.13)` the CMP0042
-> policy defaults to NEW, which makes `@rpath` the install name.
-> Consumers therefore resolve the dylibs through the rpath entries baked
-> into the binaries and/or `DYLD_LIBRARY_PATH` — never through absolute
-> library paths. (OpenCV does bake the install prefix into
-> `CMAKE_INSTALL_RPATH` for its own targets, but that affects OpenCV's
-> own test/sample binaries, not yours.)
+> policy defaults to NEW, which makes `@rpath` the install name. The
+> `@rpath` placeholder expands against `LC_RPATH` entries, so the rpath
+> each binary carries decides everything. OpenCV's own
+> `cmake/OpenCVInstallLayout.cmake` (lines 99–100) sets a *global*
+> `CMAKE_INSTALL_RPATH` to the prefix's `lib/` (plus
+> `CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE`) — a common misreading is
+> that this only affects OpenCV's own test/sample binaries, but it
+> applies to every target in the configure, the installed module dylibs
+> included. Left alone, each dylib ships with an
+> absolute build-machine path baked in (observed on a real build:
+> `path /Users/<user>/git/opencv-dev/dist/opencv/arm64-macos/lib`,
+> offset 12) — the build machine's layout leaks into the zips and
+> inter-module resolution depends on the consumer's environment. The
+> 2.2 configure therefore pins
+> `-DCMAKE_INSTALL_RPATH="@loader_path"`: `ocv_update`, the macro
+> OpenCV's script uses to set the variable, preserves a value that is
+> already defined, so the pin wins. `@loader_path` is the dyld
+> placeholder for the directory the dylib itself lives in, so each
+> module expands `@rpath` against its own directory first and the zips
+> stay relocatable. Verify after the build (must print
+> `path @loader_path`; an absolute `/Users/...` path here means the 2.2
+> pin was not passed):
+>
+> ```
+> otool -l dist/opencv/arm64-macos/lib/libopencv_core.dylib | grep -A2 LC_RPATH
+> ```
 
 > ## 3. Validate with sample/ (headless PNG round trip)
 >
@@ -569,10 +598,13 @@ consistent.
 > ```
 >
 > **3.5** Make the OpenCV libraries findable at runtime. The dylibs
-> carry `@rpath` install names (see the `otool -D` note in 2.4), so dyld
-> expands them against the rpath entries baked into the binaries; this
-> export adds a directory dyld always searches first and keeps the run
-> deterministic regardless of how those entries came out. (The
+> carry `@rpath` install names (see the `otool -D` note in 2.4), and
+> since the 2.2 pin each dylib's own `LC_RPATH` is `@loader_path` —
+> module-to-module references resolve from the dylibs' own directory.
+> The *executable's* direct dependencies are resolved against the
+> executable's rpaths first; this export adds a directory dyld always
+> searches and keeps the run deterministic regardless of what rpaths
+> the sample exe came out with. (The
 > `setup_vars_opencv5.sh` script OpenCV installs under `bin/` performs
 > the same export — and also appends a placeholder PYTHONPATH entry;
 > harmless with the bindings off.) Lasts only
@@ -617,8 +649,10 @@ consistent.
 >
 > The run proves the full loop: CMake finds the installed package
 > through `CMAKE_PREFIX_PATH`, a C++17 consumer compiles against the
-> OpenCV 5.0 headers, the dylibs load from `lib/` (via the `@rpath`
-> install names plus the `DYLD_LIBRARY_PATH` fallback from 3.5), the
+> OpenCV 5.0 headers, the dylibs load from `lib/` (module-to-module
+> references ride the dylibs' own `@loader_path` rpath from the 2.2
+> pin; the `DYLD_LIBRARY_PATH` fallback from 3.5 covers the
+> executable's direct dependencies), the
 > bundled libpng+zlib stack encodes and decodes a real PNG, and imgproc
 > computes a predictable result. It does not exercise video I/O, GUI
 > windows, DNN inference, or deployment to another machine — but nothing
