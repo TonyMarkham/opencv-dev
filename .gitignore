@@ -1,0 +1,12 @@
+# OpenCV source/build scratch area and stage logs (opencv-mac.md)
+tmp/
+
+# Local native distributions (README.md "Output layout")
+dist/
+
+# Sample consumer build tree and its PNG artifact (sample/build/)
+sample/build/
+
+# Editors/IDE
+.idea/
+.vs/
